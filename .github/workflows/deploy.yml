@@ -1,0 +1,117 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ACCOUNT_ID: "174429081191"
+  ROLE_ARN: arn:aws:iam::174429081191:role/final-project-github-actions-role
+  VISITS_INSTANCE: i-0a393b158106c0548
+  STATS_INSTANCE: i-0cc388a9700fb0b27
+  VISITS_IP: 10.0.11.187
+  DB_HOST: final-project-db.cabka4eiu840.us-east-1.rds.amazonaws.com
+  BUCKET: final-project-frontend-174429081191
+  CF_ID: E11SFLOEOW5CXY
+  CF_DOMAIN: d8n5mxau6yuqk.cloudfront.net
+  ALB_DNS: final-project-alb-1026189744.us-east-1.elb.amazonaws.com
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      visits: ${{ steps.filter.outputs.visits }}
+      stats: ${{ steps.filter.outputs.stats }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            visits:
+              - 'workloads/visits-service/**'
+            stats:
+              - 'workloads/stats-service/**'
+            frontend:
+              - 'workloads/frontend/**'
+
+  deploy-visits:
+    needs: changes
+    if: needs.changes.outputs.visits == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push
+        run: |
+          IMAGE=${{ steps.ecr.outputs.registry }}/final-project-visits-service
+          docker build -t $IMAGE:latest -t $IMAGE:${{ github.sha }} workloads/visits-service
+          docker push $IMAGE:latest
+          docker push $IMAGE:${{ github.sha }}
+      - name: Deploy via SSM
+        run: |
+          B64=$(sed -e "s|__DB_HOST__|$DB_HOST|g" -e "s|__ORIGIN__|http://$CF_DOMAIN|g" deploy/deploy-visits.sh | base64 -w0)
+          CMD=$(aws ssm send-command --instance-ids "$VISITS_INSTANCE" --document-name AWS-RunShellScript \
+            --parameters "commands=[\"echo $B64 | base64 -d > /tmp/deploy.sh\",\"bash /tmp/deploy.sh\"]" \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id "$CMD" --instance-id "$VISITS_INSTANCE"
+          aws ssm get-command-invocation --command-id "$CMD" --instance-id "$VISITS_INSTANCE" \
+            --query '{Status:Status,Out:StandardOutputContent}' --output text
+
+  deploy-stats:
+    needs: changes
+    if: needs.changes.outputs.stats == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push
+        run: |
+          IMAGE=${{ steps.ecr.outputs.registry }}/final-project-stats-service
+          docker build -t $IMAGE:latest -t $IMAGE:${{ github.sha }} workloads/stats-service
+          docker push $IMAGE:latest
+          docker push $IMAGE:${{ github.sha }}
+      - name: Deploy via SSM
+        run: |
+          B64=$(sed -e "s|__VISITS_IP__|$VISITS_IP|g" -e "s|__ORIGIN__|http://$CF_DOMAIN|g" deploy/deploy-stats.sh | base64 -w0)
+          CMD=$(aws ssm send-command --instance-ids "$STATS_INSTANCE" --document-name AWS-RunShellScript \
+            --parameters "commands=[\"echo $B64 | base64 -d > /tmp/deploy.sh\",\"bash /tmp/deploy.sh\"]" \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id "$CMD" --instance-id "$STATS_INSTANCE"
+          aws ssm get-command-invocation --command-id "$CMD" --instance-id "$STATS_INSTANCE" \
+            --query '{Status:Status,Out:StandardOutputContent}' --output text
+
+  deploy-frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Inject ALB DNS
+        run: |
+          cp -r workloads/frontend /tmp/site
+          sed -i "s|__API_BASE_URL__|http://$ALB_DNS|g" /tmp/site/index.html
+      - name: Sync to S3
+        run: aws s3 sync /tmp/site "s3://$BUCKET" --delete
+      - name: Invalidate CloudFront
+        run: aws cloudfront create-invalidation --distribution-id "$CF_ID" --paths "/*"
